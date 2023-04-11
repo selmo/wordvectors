@@ -5,31 +5,55 @@ import codecs
 import lxml.etree as ET
 import os
 import regex
+import logging
+import subprocess
+import math
+import time
+
+logger = logging.getLogger('Build_corpus')
+logger.setLevel(logging.DEBUG)
+
+ch = logging.StreamHandler()
+ch.setLevel(logging.DEBUG)
+
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+
+info    = logger.info
+warning = logger.warning
+debug   = logger.debug
 
 # arguments setting 
 parser = argparse.ArgumentParser()
 parser.add_argument('--lcode', help='ISO 639-1 code of target language. See `lcodes.txt`.')
+parser.add_argument('--date', type=str, default='20161201', help='Wiki document dumped date.')
 parser.add_argument('--max_corpus_size', type=int, default=1000000000, help='the maximum size of the corpus. Feel free to adjust it according to your computing power.')
-args = parser.parse_args()
+parser.add_argument('--nproc', type=int, default=1, help='the number of processes. It should be a number under the number of your cpu cores.')
 
+args = parser.parse_args()
 lcode = args.lcode
+date  = args.date
+nproc = args.nproc
+
 if lcode == 'ko':
     from konlpy.tag import Kkma # pip install konlpy. See http://konlpy.org/en/v0.4.4/ for further information.
     kkma = Kkma()
-    print "kkma succesfuly loaded!"
+    info("kkma succesfuly loaded!")
 elif lcode == 'ja':
     import MeCab # See https://pypi.python.org/pypi/mecab-python/0.996
     mecab = MeCab.Tagger("-Owakati")
-    print "mecab succesfuly loaded!"
+    info("mecab succesfuly loaded!")
 elif lcode == 'zh':
     import jieba # See https://pypi.python.org/pypi/jieba/
-    print "jieba succesfuly loaded!"
+    info("jieba succesfuly loaded!")
 elif lcode == 'vi':
     from pyvi.pyvi import ViTokenizer # See https://pypi.python.org/pypi/pyvi
-    print "pyvi succesfuly loaded!"
+    info("pyvi succesfuly loaded!")
 elif lcode == 'th':  
     import pythai # See https://pypi.python.org/pypi/pythai  
-    print "pythai succesfuly loaded!"
+    info("pythai succesfuly loaded!")
+
 # elif lcode == 'ar':
 #     os.environ['CLASSPATH'] = "../stanford-segmenter-2015-12-09"
 #     from nltk.tokenize.stanford_segmenter import StanfordSegmenter
@@ -40,7 +64,7 @@ elif lcode == 'th':
 #     print "StanfordSegmenter succesfuly loaded!"
     
 max_corpus_size = args.max_corpus_size
-fname = "{}wiki-20161201-pages-articles-multistream.xml".format(lcode)    
+fname = f'{lcode}wiki-{date}-pages-articles-multistream.xml'
 
 def clean_text(text):
     global lcode
@@ -133,37 +157,160 @@ def word_segment(sent):
     
     return words
 
+def count_size(file):
+    command = f"grep -o '<text ' {file} | wc -l"
+    result = subprocess.check_output(command, shell=True, text=True).strip()
+    return int(result)
+
+import os
+
+def process_text(text):
+    text   = clean_text(text)
+    sents  = sentence_segment(text)
+    output = ''
+
+    for sent in sents:
+        if sent is not None and sent != '' and sent != ' ':
+            line = ''
+            words = word_segment(sent)
+            if len(words) > 10:
+                if lcode in ['ja']:
+                    line = " ".join(words).decode('utf8') + "\n"
+                else:
+                    line = " ".join(words) + "\n"
+                output += line
+            info(f'{[os.getpid()]} line : {line[:10]}...')
+
+    return output
+
+
+import traceback
+from multiprocessing import Pool
+
+def mprocess_text(pid, q_in, q_out, i, size):
+    while True:
+        if q_in.empty():
+            debug(f'[{pid}] : queue is empty. wait for queueing...')
+            time.sleep(0.1)
+        else:
+            idx, text = q_in.get()
+
+            if idx == -1 and text == '# EXIT #':
+                break
+            else:
+                info(f'[{pid}] start process_text.')
+                try:
+                    output = process_text(text)
+                except Exception as e:
+                    debug(f'[{pid}] Exception occured : {e}')
+                    traceback.print_exc()
+                    continue
+                ci = i.value
+                i.value += 1
+                progress = round(ci/size*100, 2)
+                info(f'[{pid}] [{ci}/{size}]: {progress}% elapsed')
+                q_out.append(output)
+
+def callback_func(result):
+    info(f'callback_func got results : {result}')
+
 def build_corpus():
     global lcode, max_corpus_size, fname
-    with codecs.open("data/{}.txt".format(lcode), 'w', 'utf-8') as fout:
-        i = 1
-        j = 1
-        ns = "{http://www.mediawiki.org/xml/export-0.10/}" # namespace
-        for _, elem in ET.iterparse("data/{}".format(fname), tag=ns+"text"):
-            running_text = elem.text
-            try:
-                running_text = clean_text(running_text)
-                sents = sentence_segment(running_text)
-                for sent in sents:
-                    if sent is not None:
-                        words = word_segment(sent)
-                        if len(words) > 10:
-                            if lcode in ['ja']:
-                                fout.write(" ".join(words).decode('utf8') + "\n")
-                            else:
-                                fout.write(" ".join(words) + "\n")
-                                
-            except:
-                continue # it's okay as we have a pretty big corpus!
-            elem.clear() # We need to save memory!
-            if i % 1000 == 0: 
-                print i,
-                fsize = os.path.getsize("data/{}.txt".format(lcode))
-                if fsize > max_corpus_size:
-                    break
-            i += 1
+    output_file = f"data/{lcode}.txt"
+    target_file = f"data/{fname}"
 
+    output = ''
+    with codecs.open(output_file, 'w', 'utf-8') as fout:
+        i = 0
+        ns = "{http://www.mediawiki.org/xml/export-0.10/}" # namespace
+        info(f'Start loading file : {target_file}')
+        elem_iter = ET.iterparse(target_file, tag=ns+"text")
+        info(f'Loaded file : {target_file}')
+
+        if nproc == 1:
+            info('count total size of elements')
+            elem_size = count_size(target_file)
+            info(f'Total {elem_size} elements in the target file : {target_file}')
+            for _, elem in elem_iter:
+                i += 1
+
+                try:
+                    output += process_text(elem.text)
+                except Exception as e:
+                    debug(f'Exception occured : {e}')
+                    traceback.print_exc()
+                    continue # it's okay as we have a pretty big corpus!
+                elem.clear() # We need to save memory!
+
+                progress  = round(i/elem_size*100, 2)
+                debug(f'[{i}/{elem_size}]: {progress}% elapsed')
+
+                if len(output) > max_corpus_size:
+                    break
+            fout.write(output)
+
+        elif nproc > 1:
+            size = 0
+            p = Pool(nproc)
+            results = []
+            for _, elem in elem_iter:
+                size += 1
+                try:
+                    fout = p.apply_async(process_text, (elem.text,), callback=callback_func)
+                except Exception as e:
+                    debug(f'Exception occured : {e}')
+                    traceback.print_exc()
+                    elem.clear()
+                    continue # it's okay as we have a pretty big corpus!
+                elem.clear() # We need to save memory!
+
+                results.append(fout)
+
+            p.close()
+            p.join()
+ 
+            i = 0
+            for r in results:
+                i += 1
+                output += r.get()
+                progress  = round(i/size*100, 2)
+                debug(f'[{i}/{size}]: {progress}% elapsed')
+                output += r.get()
+
+            fout.write(output)
+
+"""
+        elif nproc > 1:
+            q_in    = Queue()
+            q_out   = Queue()
+            i_count = Value('i', 0)
+            procs   = []
+
+            for pid in range(0, nproc):
+                p = Process(target=mprocess_text, args=(str(pid), q_in, q_out, i_count, elem_size))
+                p.start()
+                procs.append(p)
+
+            for _, elem in elem_iter:
+                q_in.put((i, elem.text))
+                elem.clear()
+
+            for _ in range(0, nproc * 2):
+                q_in.put((-1, '# EXIT #'))
+
+            for p in procs:
+                p.join()
+
+            i = 0
+            size = q_out.size()
+            while True:
+                _, text = q_out.get()
+                fout.write(text)
+                info(f'Writing on file : {target_file} [{i}/{size}, {round(i/size*100, 2)}% elapsed.]')
+                if q_out.empty():
+                    break 
+"""
 if __name__ == "__main__":
     build_corpus()
     
-    print "Done"
+    info("Done")
